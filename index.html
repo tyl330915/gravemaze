@@ -407,6 +407,7 @@ function reachableDists(maze, n) {
 let maze = null, H = 0, W = 0, x0 = 0, z0 = 0;
 let world = null, solids = [];
 let exitPos = { x: 0, z: 0 }, winPos = { x: 0, z: 0 };
+let exitR = 0, exitC = 0;
 let dust = null, dustVel = null, DUST = 0;
 let birds = [];
 let stoneHeads = [];
@@ -688,7 +689,45 @@ function buildArch(exitR, exitC) {
 }
 
 // ---------------- LEVEL BUILD ----------------
-function buildLevel(n) {
+function boxesOverlap(a, b) {
+  return a.minx < b.maxx && a.maxx > b.minx && a.minz < b.maxz && a.maxz > b.minz;
+}
+
+// Is there a walkable path from the start cell to the exit cell, given ALL
+// collision solids (maze walls, grave rows, trees, statues, named graves)?
+function levelPlayable() {
+  const n = H;
+  const seen = Array.from({ length: n }, () => Array(n).fill(false));
+  const q = [[0, 0]];
+  seen[0][0] = true;
+  const inset = 1.4, half = 0.55;
+  while (q.length) {
+    const [r, c] = q.shift();
+    const cellX = x0 + c * CELL, cellZ = z0 + r * CELL;
+    const moves = [
+      [1, 0, { minx: cellX + inset, maxx: cellX + CELL - inset, minz: cellZ + CELL - half, maxz: cellZ + CELL + half }],
+      [-1, 0, { minx: cellX + inset, maxx: cellX + CELL - inset, minz: cellZ - half, maxz: cellZ + half }],
+      [0, 1, { minx: cellX + CELL - half, maxx: cellX + CELL + half, minz: cellZ + inset, maxz: cellZ + CELL - inset }],
+      [0, -1, { minx: cellX - half, maxx: cellX + half, minz: cellZ + inset, maxz: cellZ + CELL - inset }]
+    ];
+    for (let i = 0; i < 4; i++) {
+      const dir = ['S', 'N', 'E', 'W'][i];
+      const [dr, dc, rect] = moves[i];
+      const nr = r + dr, nc = c + dc;
+      if (nr < 0 || nr >= n || nc < 0 || nc >= n) continue;
+      if (seen[nr][nc]) continue;
+      if (maze[r][c][dir]) continue;                 // wall between cells
+      let clear = true;
+      for (const b of solids) { if (boxesOverlap(b, rect)) { clear = false; break; } }
+      if (!clear) continue;
+      seen[nr][nc] = true;
+      q.push([nr, nc]);
+    }
+  }
+  return seen[exitR][exitC];
+}
+
+function buildLevel(n, tries = 0) {
   if (world) { scene.remove(world); disposeGroup(world); }
   world = new THREE.Group();
   solids = [];
@@ -732,6 +771,7 @@ function buildLevel(n) {
       const c = Math.floor(Math.random() * W);
       const cell = r + ',' + c;
       if (usedCells.has(cell)) continue;
+      if (r <= 1 && c <= 1) continue;   // keep the spawn corner clear
       const m = maze[r][c];
       const opts = []; // 0=N 1=S 2=W 3=E open side
       if (r > 0 && !m.N) opts.push(0);
@@ -756,6 +796,7 @@ function buildLevel(n) {
   // trees / snags / bushes
   for (let r = 0; r < H; r++) {
     for (let c = 0; c < W; c++) {
+      if (r <= 1 && c <= 1) continue;   // keep the spawn corner clear
       const { x, z } = worldOfCell(r, c);
       const jx = x + (Math.random() - 0.5) * 3.4, jz = z + (Math.random() - 0.5) * 3.4;
       const roll = Math.random();
@@ -796,16 +837,25 @@ function buildLevel(n) {
   // exit doorway: pick a randomized far wall-adjacent cell that is provably
 // reachable and within the time budget (so the maze stays solvable)
   const maxPath = Math.floor((SPEED * cfg.time / CELL) * 0.6); // cells you can traverse in time
-  const edgeCells = [];
+  let edgeCells = [];
   for (let r = 0; r < H; r++) {
     for (let c = 0; c < W; c++) {
       const onEdge = (r === 0 || r === H - 1 || c === 0 || c === W - 1);
       if (onEdge && reach[r][c] !== -1 && reach[r][c] <= maxPath) edgeCells.push({ r, c, d: reach[r][c] });
     }
   }
+  if (!edgeCells.length) { // very long mazes: fall back to any reachable edge cell
+    for (let r = 0; r < H; r++) {
+      for (let c = 0; c < W; c++) {
+        const onEdge = (r === 0 || r === H - 1 || c === 0 || c === W - 1);
+        if (onEdge && reach[r][c] !== -1) edgeCells.push({ r, c, d: reach[r][c] });
+      }
+    }
+  }
   edgeCells.sort((a, b) => b.d - a.d);            // prefer farther (harder) exits
   const pool = edgeCells.slice(0, Math.max(2, Math.ceil(edgeCells.length * 0.3)));
   const ex = pool[Math.floor(Math.random() * pool.length)];
+  exitR = ex.r; exitC = ex.c;
   buildArch(ex.r, ex.c);
 
   const southZ = z0 + H * CELL, northZ = z0, eastX = x0 + W * CELL, westX = x0;
@@ -828,6 +878,9 @@ function buildLevel(n) {
   }
 
   addBirds();
+
+  // if scenery accidentally sealed the route, silently rebuild a fresh maze
+  if (!levelPlayable() && tries < 25) return buildLevel(n, tries + 1);
 
   // reset player to the new maze's start
   camera.position.set(x0 + CELL / 2, EYE_H, z0 + CELL / 2);
@@ -917,13 +970,25 @@ function enterGame() {
 startBtn.addEventListener('click', enterGame);
 document.addEventListener('pointerlockchange', () => {
   if (document.pointerLockElement === renderer.domElement) started = true;
+  else started = false; // paused while unlocked (clicked away / Esc)
 });
 document.addEventListener('mousemove', onMouseMove);
 function onMouseMove(e) {
+  // without pointer lock there is no reliable movementX/movementY — ignore
+  if (document.pointerLockElement !== renderer.domElement) return;
+  if (e.movementX === undefined || e.movementY === undefined) return;
   yaw -= e.movementX * 0.0022;
   pitch -= e.movementY * 0.0022;
   pitch = Math.max(-1.55, Math.min(1.55, pitch));
+  if (!Number.isFinite(yaw)) yaw = 0;   // safety net
+  if (!Number.isFinite(pitch)) pitch = 0;
 }
+// click back into the window to re-lock and resume
+renderer.domElement.addEventListener('click', () => {
+  if (!won && overlay.classList.contains('hidden') && document.pointerLockElement !== renderer.domElement) {
+    renderer.domElement.requestPointerLock();
+  }
+});
 window.addEventListener('keydown', e => {
   keys[e.code] = true;
   if (won && e.code === 'Enter' && !e.repeat) {
