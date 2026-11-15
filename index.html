@@ -689,42 +689,43 @@ function buildArch(exitR, exitC) {
 }
 
 // ---------------- LEVEL BUILD ----------------
-function boxesOverlap(a, b) {
-  return a.minx < b.maxx && a.maxx > b.minx && a.minz < b.maxz && a.maxz > b.minz;
-}
-
-// Is there a walkable path from the start cell to the exit cell, given ALL
-// collision solids (maze walls, grave rows, trees, statues, named graves)?
+// Is there a truly-walkable path from the spawn to the exit given ALL collision
+// solids (walls, grave rows, trees, statues, named graves)? Rasterize the world
+// to a fine grid, dilate blocked cells by the player radius, then flood-fill.
+// This mirrors the real player circle, so it can't miss an interior choke point.
 function levelPlayable() {
-  const n = H;
-  const seen = Array.from({ length: n }, () => Array(n).fill(false));
-  const q = [[0, 0]];
-  seen[0][0] = true;
-  const inset = 1.4, half = 0.55;
-  while (q.length) {
-    const [r, c] = q.shift();
-    const cellX = x0 + c * CELL, cellZ = z0 + r * CELL;
-    const moves = [
-      [1, 0, { minx: cellX + inset, maxx: cellX + CELL - inset, minz: cellZ + CELL - half, maxz: cellZ + CELL + half }],
-      [-1, 0, { minx: cellX + inset, maxx: cellX + CELL - inset, minz: cellZ - half, maxz: cellZ + half }],
-      [0, 1, { minx: cellX + CELL - half, maxx: cellX + CELL + half, minz: cellZ + inset, maxz: cellZ + CELL - inset }],
-      [0, -1, { minx: cellX - half, maxx: cellX + half, minz: cellZ + inset, maxz: cellZ + CELL - inset }]
-    ];
-    for (let i = 0; i < 4; i++) {
-      const dir = ['S', 'N', 'E', 'W'][i];
-      const [dr, dc, rect] = moves[i];
-      const nr = r + dr, nc = c + dc;
-      if (nr < 0 || nr >= n || nc < 0 || nc >= n) continue;
-      if (seen[nr][nc]) continue;
-      if (maze[r][c][dir]) continue;                 // wall between cells
-      let clear = true;
-      for (const b of solids) { if (boxesOverlap(b, rect)) { clear = false; break; } }
-      if (!clear) continue;
-      seen[nr][nc] = true;
-      q.push([nr, nc]);
+  const step = 0.25;
+  const gx = Math.ceil((W * CELL) / step);
+  const gz = Math.ceil((H * CELL) / step);
+  const pad = Math.ceil(HURT_R / step) + 1;   // dilation (>= player radius)
+  const idx = v => Math.floor((v - x0) / step);
+  const idz = v => Math.floor((v - z0) / step);
+  const blocked = new Uint8Array(gx * gz);
+  for (const b of solids) {
+    const x0i = Math.max(0, idx(b.minx) - pad), x1i = Math.min(gx - 1, idx(b.maxx) + pad);
+    const z0i = Math.max(0, idz(b.minz) - pad), z1i = Math.min(gz - 1, idz(b.maxz) + pad);
+    for (let z = z0i; z <= z1i; z++) {
+      const row = z * gx;
+      for (let x = x0i; x <= x1i; x++) blocked[row + x] = 1;
     }
   }
-  return seen[exitR][exitC];
+  const sx = Math.max(0, Math.min(gx - 1, idx(x0 + CELL / 2)));
+  const sz = Math.max(0, Math.min(gz - 1, idz(z0 + CELL / 2)));
+  const gbx = Math.max(0, Math.min(gx - 1, idx(winPos.x)));
+  const gbz = Math.max(0, Math.min(gz - 1, idz(winPos.z)));
+  const seen = new Uint8Array(gx * gz);
+  const q = [sz * gx + sx];
+  seen[sz * gx + sx] = 1;
+  while (q.length) {
+    const id = q.pop();
+    const x = id % gx, z = (id / gx) | 0;
+    if (Math.abs(x - gbx) <= 1 && Math.abs(z - gbz) <= 1) return true;
+    if (x > 0) { const ni = id - 1; if (!blocked[ni] && !seen[ni]) { seen[ni] = 1; q.push(ni); } }
+    if (x < gx - 1) { const ni = id + 1; if (!blocked[ni] && !seen[ni]) { seen[ni] = 1; q.push(ni); } }
+    if (z > 0) { const ni = id - gx; if (!blocked[ni] && !seen[ni]) { seen[ni] = 1; q.push(ni); } }
+    if (z < gz - 1) { const ni = id + gx; if (!blocked[ni] && !seen[ni]) { seen[ni] = 1; q.push(ni); } }
+  }
+  return false;
 }
 
 function buildLevel(n, tries = 0) {
@@ -880,7 +881,7 @@ function buildLevel(n, tries = 0) {
   addBirds();
 
   // if scenery accidentally sealed the route, silently rebuild a fresh maze
-  if (!levelPlayable() && tries < 25) return buildLevel(n, tries + 1);
+  if (!levelPlayable() && tries < 40) return buildLevel(n, tries + 1);
 
   // reset player to the new maze's start
   camera.position.set(x0 + CELL / 2, EYE_H, z0 + CELL / 2);
