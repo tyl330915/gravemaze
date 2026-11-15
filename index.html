@@ -1,0 +1,1004 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GraveMaze</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; font-family: monospace; }
+  canvas { display: block; }
+  #overlay {
+    position: fixed; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; text-align: center;
+    background: rgba(0,0,0,0.8); color: #ddd; z-index: 10; user-select: none; line-height: 1.6;
+  }
+  #overlay.hidden { display: none; }
+  h1 { letter-spacing: 6px; margin: 0 0 16px; color: #c8a25a; }
+  #msg { margin-bottom: 24px; max-width: 430px; }
+  button {
+    font: inherit; font-size: 18px; padding: 10px 28px; cursor: pointer;
+    background: #222; color: #ddd; border: 1px solid #555; border-radius: 4px;
+  }
+  button:hover { background: #333; border-color: #c8a25a; color: #fff; }
+  #timer { position: fixed; top: 14px; right: 18px; color: #ddd; font-size: 24px; z-index: 6; }
+  #level { position: fixed; top: 14px; left: 18px; color: #aaa; font-size: 18px; z-index: 6; }
+  #score { position: fixed; top: 16px; left: 50%; transform: translateX(-50%); color: #ffd77a; font-size: 22px; z-index: 6; }
+  #best { position: fixed; top: 46px; left: 50%; transform: translateX(-50%); color: #aa9a6a; font-size: 14px; z-index: 6; }
+  #hint { position: fixed; left: 12px; bottom: 12px; color: #888; font-size: 13px; z-index: 6; }
+  #msg .live { color: #ffd77a; }
+  #msg .kbd { border: 1px solid #666; padding: 1px 7px; border-radius: 3px; background: #333; color: #fff; }
+</style>
+</head>
+<body>
+<div id="overlay">
+  <h1>GRAVEMAZE</h1>
+  <div id="msg">Escape the cemetery maze. Find the exit — the lit door in the wall.<br><span class="live">The ranks of graves block your view. Read the names carefully.</span></div>
+  <button id="startBtn">Click to begin</button>
+  <div style="margin-top:12px;color:#666;font-size:13px;">Mouse: look &middot; WASD: move</div>
+</div>
+<div id="timer">--</div>
+<div id="level">Maze 1</div>
+<div id="score">0</div>
+<div id="best"></div>
+<div id="hint">click to lock mouse &middot; WASD move</div>
+
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+</script>
+<script type="module">
+import * as THREE from 'three';
+
+// ---------------- BASE TUNING ----------------
+const CELL        = 6;
+const WALL_H      = 4.2;
+const HEADSTONE_H = 2.1;
+const HEADSTONE_W = 1.2;
+const HEADSTONE_D = 0.4;
+const SLAB_W      = 2.0;
+const SLAB_D      = 0.3;
+const SLAB_H      = 0.65;
+const GRAVE_T     = 0.55;
+const TREE_P      = 0.12;
+const STAT_P      = 0.05;       // chance a statue stands in a cell
+const TREE_H      = 6.5;
+const EYE_H       = 1.7;
+const SPEED       = 6.5;
+const HURT_R      = 0.55;
+const WIN_R       = 1.2;
+
+// difficulty: bigger maze, fewer shortcut loops, less time as you advance
+function levelConfig(n) {
+  const size = 9 + 2 * Math.min(n, 6);                 // 9, 11, 13, ...
+  const loops = Math.max(0.02, 0.18 - 0.025 * n);      // fewer loops -> harder
+  const time = Math.max(45, 90 - 4 * n);               // less time
+  return { size, loops, time };
+}
+
+// ---------------- RENDERER / SCENE ----------------
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x2b2f36);
+scene.fog = new THREE.Fog(0x3c414c, 40, 130);
+
+const camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.1, 400);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const hemi = new THREE.HemisphereLight(0xcfd6e2, 0x37422a, 1.05);
+scene.add(hemi);
+const sun = new THREE.DirectionalLight(0xffe2b8, 1.25);
+sun.position.set(-60, 80, -40);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.camera.left = -110; sun.shadow.camera.right = 110;
+sun.shadow.camera.top = 110; sun.shadow.camera.bottom = -110;
+sun.shadow.camera.far = 200;
+scene.add(sun);
+
+// ---------------- TEXTURES ----------------
+const NAMES = [
+  'M\u00fcller', 'Schmidt', 'Kaiser', 'Weber', 'Lorenz', 'Kr\u00fcger',
+  'Braun', 'Sturm', 'Gruber', 'H\u00fcgel', 'Stein', 'Bergmann',
+  'Moos', 'Fischer', 'Wagner', 'Schatten', 'Ansel', 'Wacht',
+  'Kind', 'Reinhold', 'Nachtigall', 'Ziegler', 'Lindner', 'Tischler'
+];
+
+function makeNameTexture(name, worn) {
+  const c = document.createElement('canvas');
+  c.width = 128; c.height = 256;
+  const g = c.getContext('2d');
+  g.fillStyle = '#b8b4ab';
+  g.fillRect(0, 0, 128, 256);
+  for (let i = 0; i < 320; i++) {
+    const v = 120 + Math.random() * 70 | 0;
+    g.fillStyle = `rgba(${v},${v},${v - 8},${0.15 + Math.random() * 0.3})`;
+    g.fillRect(Math.random() * 128, Math.random() * 256, 2 + Math.random() * 4, 2 + Math.random() * 4);
+  }
+  g.fillStyle = 'rgba(70,65,60,0.10)';
+  g.beginPath();
+  g.arc(64, 200, 120, 0, Math.PI * 2);
+  g.fill();
+  g.save();
+  g.fillStyle = worn ? 'rgba(70,65,60,0.28)' : 'rgba(80,74,68,0.85)';
+  g.font = '700 26px Georgia, "Times New Roman", serif';
+  g.textAlign = 'center';
+  g.translate(64, 130);
+  g.rotate((Math.random() - 0.5) * 0.03);
+  if (worn) {
+    g.fillText(name, 0, 0);
+    g.globalCompositeOperation = 'destination-out';
+    g.fillRect(20, -10, 90, 8);
+    g.globalCompositeOperation = 'source-over';
+  } else {
+    g.fillText(name, 0, 0);
+  }
+  g.restore();
+  g.fillStyle = 'rgba(90,84,76,0.18)';
+  for (let i = 0; i < 6; i++) g.fillRect(Math.random() * 128, Math.random() * 256, 2, 8 + Math.random() * 40);
+  g.strokeStyle = 'rgba(60,55,50,0.5)';
+  g.lineWidth = 1;
+  for (let i = 0; i < 3; i++) {
+    let x = Math.random() * 128, y = Math.random() * 256;
+    g.beginPath(); g.moveTo(x, y);
+    const seg = 6 + Math.random() * 20;
+    g.lineTo(x - seg, y + seg * 2);
+    g.stroke();
+  }
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.anisotropy = 4;
+  return t;
+}
+const nameTextures = NAMES.map(n => makeNameTexture(n, false));
+const wornTextures = NAMES.map(n => makeNameTexture(n, true));
+const SPECIAL = ['Haig', 'Laycock', 'Leathart', 'Jolowicz', 'Cooke', 'Burgess'];
+const specialTex = SPECIAL.map(n => makeNameTexture(n, false));
+
+function makeBrickTexture() {
+  const c = document.createElement('canvas');
+  c.width = 128; c.height = 64;
+  const g = c.getContext('2d');
+  g.fillStyle = '#7a4b3a';
+  g.fillRect(0, 0, 128, 64);
+  const bh = 14, bw = 30;
+  for (let r = 0; r < 4; r++) {
+    for (let x = 0; x < 128; x += bw) {
+      const off = (r % 2) ? bw / 2 : 0;
+      g.fillStyle = r % 2 === 0 ? '#96523c' : '#8a4a3a';
+      g.fillRect(x + off + 1, r * bh + 1, bw - 2, bh - 2);
+    }
+  }
+  g.strokeStyle = '#5c3628';
+  g.lineWidth = 2;
+  for (let y = 0; y <= 64; y += bh) { g.beginPath(); g.moveTo(0, y); g.lineTo(128, y); g.stroke(); }
+  for (let r = 0; r < 4; r++) {
+    for (let x = 0; x <= 128; x += bw) {
+      const off = (r % 2) ? bw / 2 : 0;
+      g.beginPath(); g.moveTo(x + off, r * bh); g.lineTo(x + off, r * bh + bh); g.stroke();
+    }
+  }
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  return t;
+}
+const brickTex = makeBrickTexture();
+
+function makeRadialTexture() {
+  const c = document.createElement('canvas');
+  c.width = 64; c.height = 64;
+  const g = c.getContext('2d');
+  const grd = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+  grd.addColorStop(0, 'rgba(255,255,255,1)');
+  grd.addColorStop(0.4, 'rgba(255,255,255,0.6)');
+  grd.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = grd; g.fillRect(0, 0, 64, 64);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+const radialTex = makeRadialTexture();
+
+function makeGroundTexture() {
+  const c = document.createElement('canvas');
+  c.width = 256; c.height = 256;
+  const g = c.getContext('2d');
+  g.fillStyle = '#5b6f43';
+  g.fillRect(0, 0, 256, 256);
+  for (let i = 0; i < 3000; i++) {
+    const shade = 90 + Math.random() * 60 | 0;
+    g.fillStyle = `rgba(${shade - 10},${shade},${shade - 30},${0.4 + Math.random() * 0.5})`;
+    g.fillRect(Math.random() * 256, Math.random() * 256, 1.2, 2 + Math.random() * 3);
+  }
+  for (let p = 0; p < 14; p++) {
+    const ox = Math.random() * 256, oy = Math.random() * 256, r = 18 + Math.random() * 30;
+    const grd = g.createRadialGradient(ox, oy, 2, ox, oy, r);
+    grd.addColorStop(0, 'rgba(110,92,60,0.55)');
+    grd.addColorStop(1, 'rgba(110,92,60,0)');
+    g.fillStyle = grd;
+    g.beginPath(); g.arc(ox, oy, r, 0, Math.PI * 2); g.fill();
+  }
+  for (let i = 0; i < 60; i++) {
+    const v = 130 + Math.random() * 50 | 0;
+    g.fillStyle = `rgba(${v},${v},${v},0.6)`;
+    g.beginPath(); g.arc(Math.random() * 256, Math.random() * 256, 1 + Math.random() * 2, 0, Math.PI * 2); g.fill();
+  }
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  return t;
+}
+const groundTex = makeGroundTexture();
+groundTex.repeat.set(70, 70);
+
+function makeSkyTexture() {
+  const c = document.createElement('canvas');
+  c.width = 16; c.height = 256;
+  const g = c.getContext('2d');
+  const grd = g.createLinearGradient(0, 0, 0, 256);
+  grd.addColorStop(0, '#0d1016');
+  grd.addColorStop(0.55, '#26303d');
+  grd.addColorStop(0.85, '#55617a');
+  grd.addColorStop(1, '#d8b27a');
+  g.fillStyle = grd;
+  g.fillRect(0, 0, 16, 256);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+const skyTex = makeSkyTexture();
+
+function makeArchTexture() {
+  const c = document.createElement('canvas');
+  c.width = 512; c.height = 96;
+  const g = c.getContext('2d');
+  g.fillStyle = '#9a9389';
+  g.fillRect(0, 0, 512, 96);
+  for (let i = 0; i < 500; i++) {
+    const v = 130 + Math.random() * 50 | 0;
+    g.fillStyle = `rgba(${v},${v},${v - 6},${0.15 + Math.random() * 0.3})`;
+    g.fillRect(Math.random() * 512, Math.random() * 96, 2 + Math.random() * 5, 1 + Math.random() * 3);
+  }
+  g.textAlign = 'center';
+  g.textBaseline = 'middle';
+  g.fillStyle = 'rgba(0,0,0,0.22)';
+  g.font = '700 48px Georgia, "Times New Roman", serif';
+  g.fillText('AUSFAHRT', 253, 46);
+  g.fillStyle = 'rgba(70,64,58,0.9)';
+  g.font = '700 48px Georgia, "Times New Roman", serif';
+  g.fillText('AUSFAHRT', 250, 43);
+  g.fillStyle = 'rgba(0,0,0,0.18)';
+  g.font = 'italic 24px Georgia, "Times New Roman", serif';
+  g.fillText('stop giggling', 253, 79);
+  g.fillStyle = 'rgba(70,64,58,0.72)';
+  g.font = 'italic 24px Georgia, "Times New Roman", serif';
+  g.fillText('stop giggling', 250, 76.5);
+  g.globalCompositeOperation = 'destination-out';
+  g.fillRect(150, 28, 220, 6);
+  g.globalCompositeOperation = 'source-over';
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.anisotropy = 4;
+  return t;
+}
+const archTex = makeArchTexture();
+
+function makeWoodTexture() {
+  const c = document.createElement('canvas');
+  c.width = 128; c.height = 256;
+  const g = c.getContext('2d');
+  g.fillStyle = '#6b4a2c';
+  g.fillRect(0, 0, 128, 256);
+  for (let x = 0; x < 128; x += 16) {
+    const l = 60 + Math.random() * 20 | 0, sh = Math.random() * 0.2;
+    g.fillStyle = `rgba(${l},${l - 18},${l - 30},${0.5 + sh})`;
+    g.fillRect(x, 0, 12, 256);
+  }
+  for (let i = 0; i < 700; i++) {
+    const sh = 70 + Math.random() * 60 | 0;
+    g.fillStyle = `rgba(${sh},${sh - 22},${sh - 34},${Math.random() * 0.5})`;
+    g.fillRect(Math.random() * 128, Math.random() * 256, 1, 14 + Math.random() * 26);
+  }
+  g.strokeStyle = 'rgba(35,22,12,0.8)';
+  g.lineWidth = 2;
+  for (let x = 0; x < 128; x += 16) { g.beginPath(); g.moveTo(x + 13, 0); g.lineTo(x + 13, 256); g.stroke(); }
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  return t;
+}
+const woodTex = makeWoodTexture();
+
+const mat = {
+  slab:    new THREE.MeshStandardMaterial({ color: 0xb5b2a8, roughness: 0.9 }),
+  brick:   new THREE.MeshStandardMaterial({ map: brickTex, roughness: 1 }),
+  trunk:   new THREE.MeshStandardMaterial({ color: 0x6c5138 }),
+  foliage: new THREE.MeshStandardMaterial({ color: 0x3f6b35 }),
+  bush:    new THREE.MeshStandardMaterial({ color: 0x35502c }),
+  snag:    new THREE.MeshStandardMaterial({ color: 0x4a3c33 }),
+  gate:    new THREE.MeshStandardMaterial({ color: 0xffd77a, emissive: 0x8a6a10, emissiveIntensity: 0.8 }),
+  arch:    new THREE.MeshStandardMaterial({ map: archTex, roughness: 0.9 }),
+  stone:   new THREE.MeshStandardMaterial({ color: 0x8f887e, roughness: 0.95 }),
+  door:    new THREE.MeshStandardMaterial({ map: woodTex, roughness: 0.85 }),
+  angel:   new THREE.MeshStandardMaterial({ color: 0x9aa3a4, roughness: 0.95 }),
+  marble:  new THREE.MeshStandardMaterial({ color: 0xc9c6c0, roughness: 0.9 }),
+  mist:    new THREE.MeshBasicMaterial({ map: radialTex, color: 0xc3d3e2, transparent: true, opacity: 0.22, depthWrite: false })
+};
+
+// persistent backdrop
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(500, 500), new THREE.MeshStandardMaterial({ map: groundTex, roughness: 1 }));
+ground.rotation.x = -Math.PI / 2;
+ground.receiveShadow = true;
+scene.add(ground);
+
+const sky = new THREE.Mesh(new THREE.SphereGeometry(260, 32, 18), new THREE.MeshBasicMaterial({ map: skyTex, side: THREE.BackSide, fog: false }));
+sky.rotation.y = 1.0;
+scene.add(sky);
+
+// persistent exit lighting (repositioned each level)
+const exitLight = new THREE.PointLight(0xffc490, 1.6, 16, 1.8);
+scene.add(exitLight);
+const doorGlow = new THREE.Sprite(new THREE.SpriteMaterial({
+  map: radialTex, color: 0xffc490, transparent: true, opacity: 0.4,
+  depthWrite: false, blending: THREE.AdditiveBlending
+}));
+doorGlow.scale.set(3.4, 5.5, 1);
+scene.add(doorGlow);
+
+// ---------------- MAZE GENERATION ----------------
+function generateMaze(n, loops) {
+  const m = [];
+  for (let r = 0; r < n; r++) {
+    m[r] = [];
+    for (let c = 0; c < n; c++) m[r][c] = { N: true, E: true, S: true, W: true };
+  }
+  const vis = Array.from({ length: n }, () => Array(n).fill(false));
+  const stack = [[0, 0]];
+  vis[0][0] = true;
+  while (stack.length) {
+    const [r, c] = stack[stack.length - 1];
+    const opts = [[r + 1, c], [r - 1, c], [r, c + 1], [r, c - 1]].filter(
+      ([nr, nc]) => nr >= 0 && nr < n && nc >= 0 && nc < n && !vis[nr][nc]);
+    if (!opts.length) { stack.pop(); continue; }
+    const [nr, nc] = opts[Math.floor(Math.random() * opts.length)];
+    if (nr === r + 1) { m[r][c].S = false; m[nr][nc].N = false; }
+    else if (nr === r - 1) { m[r][c].N = false; m[nr][nc].S = false; }
+    else if (nc === c + 1) { m[r][c].E = false; m[nr][nc].W = false; }
+    else if (nc === c - 1) { m[r][c].W = false; m[nr][nc].E = false; }
+    vis[nr][nc] = true;
+    stack.push([nr, nc]);
+  }
+  const opens = Math.floor(n * n * loops);
+  for (let k = 0; k < opens; k++) {
+    const r = Math.floor(Math.random() * n), c = Math.floor(Math.random() * n);
+    const d = ['N', 'E', 'S', 'W'][Math.floor(Math.random() * 4)];
+    const nr = r + (d === 'S' ? 1 : d === 'N' ? -1 : 0), nc = c + (d === 'E' ? 1 : d === 'W' ? -1 : 0);
+    if (nr < 0 || nr >= n || nc < 0 || nc >= n) continue;
+    m[r][c][d] = false;
+    m[nr][nc][{ N: 'S', S: 'N', E: 'W', W: 'E' }[d]] = false;
+  }
+  return m;
+}
+
+// ---------------- MUTABLE WORLD STATE ----------------
+let maze = null, H = 0, W = 0, x0 = 0, z0 = 0;
+let world = null, solids = [];
+let exitPos = { x: 0, z: 0 }, winPos = { x: 0, z: 0 };
+let dust = null, dustVel = null, DUST = 0;
+let birds = [];
+let stoneHeads = [];
+let level = 0;
+
+function disposeGroup(g) {
+  g.traverse(o => {
+    if (o.geometry) o.geometry.dispose();
+    if (o.material) {
+      const mats = Array.isArray(o.material) ? o.material : [o.material];
+      mats.forEach(m => { if (m.map && m.map.dispose) m.map.dispose(); m.dispose(); });
+    }
+  });
+}
+
+function worldOfCell(r, c) {
+  return { x: x0 + c * CELL + CELL / 2, z: z0 + r * CELL + CELL / 2 };
+}
+function openSides(r, c) {
+  const m = maze[r][c];
+  let n = 0;
+  if (r > 0 && !m.N) n++;
+  if (r < H - 1 && !m.S) n++;
+  if (c > 0 && !m.W) n++;
+  if (c < W - 1 && !m.E) n++;
+  return n;
+}
+function addBrick(mx, mz, w, d) {
+  const b = mat.brick.clone();
+  b.map = b.map.clone();
+  b.map.repeat.set(Math.max(1, Math.floor(w / 4)), 1);
+  const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, WALL_H, d), b);
+  mesh.position.set(mx, WALL_H / 2 - 0.05, mz);
+  mesh.castShadow = mesh.receiveShadow = true;
+  world.add(mesh);
+  solids.push({ minx: mx - w / 2, maxx: mx + w / 2, minz: mz - d / 2, maxz: mz + d / 2 });
+}
+function placeHeadstone(x, z, faceX, faceZ, tex) {
+  const g = new THREE.Group();
+  const slab = new THREE.Mesh(new THREE.BoxGeometry(SLAB_W, SLAB_H, SLAB_D), mat.slab);
+  slab.position.y = SLAB_H / 2;
+  slab.castShadow = true;
+  // inscription only on the front (+z) face; plain stone on the other five
+  const plainStone = new THREE.MeshStandardMaterial({ color: 0x9a978e, roughness: 0.95 });
+  const faceStone = new THREE.MeshStandardMaterial({ map: tex, roughness: 0.9 });
+  const head = new THREE.Mesh(
+    new THREE.BoxGeometry(HEADSTONE_W, HEADSTONE_H, HEADSTONE_D),
+    [plainStone, plainStone, plainStone, plainStone, faceStone, plainStone] // +z = face index 4
+  );
+  head.position.set(0, HEADSTONE_H / 2, SLAB_D / 2 + HEADSTONE_D / 2 + 0.04);
+  head.castShadow = true;
+  stoneHeads.push(head);
+  g.add(slab, head);
+  g.rotation.y = Math.atan2(faceX, faceZ);
+  g.position.set(x, 0, z);
+  world.add(g);
+  const R = SLAB_W / 2 + 0.12;
+  solids.push({ minx: x - R, maxx: x + R, minz: z - R, maxz: z + R });
+}
+function graveRowWall(mx, mz, horizontal) {
+  const randTex = () => (Math.random() < 0.7 ? wornTextures[Math.floor(Math.random() * NAMES.length)] : nameTextures[Math.floor(Math.random() * NAMES.length)]);
+  const posA = [-2.4, 0, 2.4];
+  const posB = [-1.2, 1.2];
+  if (horizontal) {
+    for (const p of posA) placeHeadstone(mx + p, mz + GRAVE_T, 0, 1, randTex());
+    for (const p of posA) placeHeadstone(mx + p, mz - GRAVE_T, 0, -1, randTex());
+  } else {
+    for (const p of posA) placeHeadstone(mx + GRAVE_T, mz + p, 1, 0, randTex());
+    for (const p of posB) placeHeadstone(mx - GRAVE_T, mz + p, -1, 0, randTex());
+  }
+}
+function segment(r, c, side, cx, cz) {
+  let isBorder = false;
+  if (side === 'E') isBorder = (c === W - 1);
+  if (side === 'S') isBorder = (r === H - 1);
+  let isLeafCap = false;
+  if (!isBorder && side === 'E') {
+    if (openSides(r, c) === 1 && maze[r][c].W === false) isLeafCap = true;
+    if (openSides(r, c + 1) === 1 && maze[r][c + 1].E === false) isLeafCap = true;
+  } else if (!isBorder && side === 'S') {
+    if (openSides(r, c) === 1 && maze[r][c].N === false) isLeafCap = true;
+    if (openSides(r + 1, c) === 1 && maze[r + 1][c].S === false) isLeafCap = true;
+  }
+  if (side === 'N') { addBrick(cx, cz - CELL / 2, CELL + 0.8, 0.7); return; }
+  if (side === 'W') { addBrick(cx - CELL / 2, cz, 0.7, CELL + 0.8); return; }
+  if (side === 'E') {
+    if (isBorder || isLeafCap) addBrick(cx + CELL / 2, cz, 0.7, CELL + 0.8);
+    else graveRowWall(cx + CELL / 2, cz, false);
+    return;
+  }
+  if (side === 'S') {
+    if (isBorder || isLeafCap) addBrick(cx, cz + CELL / 2, CELL + 0.8, 0.7);
+    else graveRowWall(cx, cz + CELL / 2, true);
+  }
+}
+
+function addTree(x, z, scale) {
+  const t = new THREE.Group();
+  const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.45, TREE_H * 0.55, 7), mat.trunk);
+  trunk.position.y = TREE_H * 0.28;
+  trunk.castShadow = true;
+  const fol = new THREE.Mesh(new THREE.ConeGeometry(1.7 * scale, TREE_H * scale, 7), mat.foliage);
+  fol.position.y = TREE_H * (0.55 + scale * 0.25);
+  fol.castShadow = true;
+  const fol2 = new THREE.Mesh(new THREE.ConeGeometry(1.1 * scale, TREE_H * 0.6 * scale, 7), mat.foliage);
+  fol2.position.y = TREE_H * (0.4 + scale * 0.5);
+  fol2.castShadow = true;
+  t.add(trunk, fol, fol2);
+  t.position.set(x, 0, z);
+  t.rotation.y = Math.random() * Math.PI * 2;
+  world.add(t);
+  solids.push({ minx: x - 0.5, maxx: x + 0.5, minz: z - 0.5, maxz: z + 0.5 });
+}
+function addSnag(x, z, scale) {
+  const t = new THREE.Group();
+  const h = TREE_H * (0.5 + 0.3 * scale);
+  const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.2 * scale, 0.4 * scale, h * 0.7, 7), mat.snag);
+  trunk.position.y = h * 0.35;
+  trunk.castShadow = true;
+  t.add(trunk);
+  for (let i = 0; i < 3; i++) {
+    const limb = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.1, 0.8 + Math.random() * 1.2, 5), mat.snag);
+    limb.position.set(0, h * (0.45 + Math.random() * 0.3), 0);
+    limb.rotation.set(Math.random(), Math.random() * Math.PI, Math.random() * 0.6);
+    t.add(limb);
+  }
+  t.position.set(x, 0, z);
+  t.rotation.y = Math.random() * Math.PI * 2;
+  world.add(t);
+  solids.push({ minx: x - 0.4, maxx: x + 0.4, minz: z - 0.4, maxz: z + 0.4 });
+}
+function addBush(x, z, scale) {
+  const b = new THREE.Group();
+  const n = 3 + Math.floor(Math.random() * 2);
+  for (let i = 0; i < n; i++) {
+    const sph = new THREE.Mesh(new THREE.SphereGeometry((0.4 + Math.random() * 0.3) * scale, 7, 6), mat.bush);
+    sph.position.set((Math.random() - 0.5) * 0.7, (0.32 + Math.random() * 0.2) * scale, (Math.random() - 0.5) * 0.7);
+    sph.castShadow = true;
+    b.add(sph);
+  }
+  b.position.set(x, 0, z);
+  world.add(b);
+  solids.push({ minx: x - 0.6, maxx: x + 0.6, minz: z - 0.6, maxz: z + 0.6 });
+}
+function part(geo, mt, x, y, z, rx, ry, rz, sx, sy, sz) {
+  const m = new THREE.Mesh(geo, mt);
+  m.position.set(x, y, z);
+  m.rotation.set(rx || 0, ry || 0, rz || 0);
+  m.scale.set(sx ?? 1, sy ?? 1, sz ?? 1);
+  m.castShadow = true;
+  return m;
+}
+
+// ----- Statues -----
+function addWeepingAngel(x, z) {
+  const g = new THREE.Group();
+  const s = mat.angel;
+  g.add(part(new THREE.BoxGeometry(1.5, 0.55, 1.5), s, 0, 0.28, 0));          // pedestal
+  g.add(part(new THREE.ConeGeometry(0.5, 1.1, 8), s, 0, 0.95, 0));            // robed lower body
+  g.add(part(new THREE.CapsuleGeometry(0.42, 0.3, 4, 8), s, 0, 1.5, 0.05));   // torso, leaning
+  g.add(part(new THREE.SphereGeometry(0.2, 10, 8), s, 0, 2.0, 0.08, 0.7));    // bowed head
+  // arms raised to hide the face
+  g.add(part(new THREE.BoxGeometry(0.14, 0.6, 0.18), s, -0.24, 1.86, 0.06, 0.6, 0.05, 0.2));
+  g.add(part(new THREE.BoxGeometry(0.14, 0.6, 0.18), s, 0.24, 1.86, 0.06, 0.6, -0.05, -0.2));
+  // folded wings behind
+  for (const side of [-1, 1]) {
+    g.add(part(new THREE.BoxGeometry(1.35, 0.07, 0.55), s, side * 0.5, 1.75, -0.12, -0.5, side * 0.45, 0));
+    g.add(part(new THREE.BoxGeometry(0.95, 0.06, 0.45), s, side * 0.85, 1.48, -0.05, -0.65, side * 0.8, 0));
+  }
+  g.position.set(x, 0, z);
+  g.rotation.y = Math.random() * Math.PI * 2;
+  world.add(g);
+  const R = 0.85;
+  solids.push({ minx: x - R, maxx: x + R, minz: z - R, maxz: z + R });
+}
+function addRecumbent(x, z) {
+  const g = new THREE.Group();
+  const s = mat.marble;
+  g.add(part(new THREE.BoxGeometry(2.4, 0.75, 1.15), s, 0, 0.37, 0));       // sarcophagus
+  g.add(part(new THREE.BoxGeometry(2.2, 0.16, 0.95), s, 0, 0.82, 0));       // lid
+  // recumbent effigy lying along +x, on one elbow
+  g.add(part(new THREE.CylinderGeometry(0.22, 0.27, 1.25, 10), s, 0, 1.05, 0, 0, 0, Math.PI / 2));
+  g.add(part(new THREE.SphereGeometry(0.2, 10, 8), s, 0.98, 1.08, 0));      // head
+  g.add(part(new THREE.CylinderGeometry(0.06, 0.08, 0.55, 8), s, -0.5, 1.3, 0.18, 0.6, 0.35, 0)); // raised forearm
+  g.add(part(new THREE.CylinderGeometry(0.09, 0.13, 0.5, 8), s, -1.05, 1.0, 0.08, 0.5, -0.2, 0)); // bent legs
+  g.position.set(x, 0, z);
+  g.rotation.y = Math.random() * Math.PI * 2;
+  world.add(g);
+  const R = 1.4;
+  solids.push({ minx: x - R, maxx: x + R, minz: z - R, maxz: z + R });
+}
+function addUrn(x, z) {
+  const g = new THREE.Group();
+  const s = mat.angel;
+  g.add(part(new THREE.BoxGeometry(0.95, 0.5, 0.95), s, 0, 0.25, 0));         // plinth
+  g.add(part(new THREE.CylinderGeometry(0.18, 0.28, 0.95, 10), s, 0, 0.98, 0)); // urn body
+  g.add(part(new THREE.SphereGeometry(0.24, 10, 8), s, 0, 1.42, 0));           // knob
+  g.position.set(x, 0, z);
+  g.rotation.y = Math.random() * Math.PI * 2;
+  world.add(g);
+  const R = 0.6;
+  solids.push({ minx: x - R, maxx: x + R, minz: z - R, maxz: z + R });
+}
+function addStatue(x, z) {
+  const r = Math.random();
+  if (r < 0.45) addWeepingAngel(x, z);
+  else if (r < 0.75) addRecumbent(x, z);
+  else addUrn(x, z);
+}
+
+function buildArch(exitR, exitC) {
+  exitPos = worldOfCell(exitR, exitC);
+  const g = new THREE.Group();
+  const springY = 1.9, OH = 1.0, colW = 0.42, depth = 0.5;
+  const OHo = OH + colW;
+  const apex = springY + 1.25;
+  const N = 22;
+  function quad(pts, p0, c, p2) {
+    for (let i = 0; i <= N; i++) {
+      const t = i / N, a = 1 - t;
+      pts.push([a * a * p0[0] + 2 * a * t * c[0] + t * t * p2[0],
+                a * a * p0[1] + 2 * a * t * c[1] + t * t * p2[1]]);
+    }
+  }
+  const outline = [];
+  outline.push([-OHo, springY]);
+  quad(outline, [-OHo, springY], [-0.6, apex + 0.3], [0, apex]);
+  quad(outline, [0, apex], [0.6, apex + 0.3], [OHo, springY]);
+  outline.push([OHo, springY]);
+  const shp = new THREE.Shape();
+  shp.moveTo(outline[0][0], outline[0][1]);
+  for (let i = 1; i < outline.length; i++) shp.lineTo(outline[i][0], outline[i][1]);
+  shp.closePath();
+
+  const gable = new THREE.Mesh(new THREE.ExtrudeGeometry(shp, { depth, bevelEnabled: false }), mat.stone.clone());
+  gable.material.side = THREE.DoubleSide;
+  gable.castShadow = gable.receiveShadow = true;
+  gable.position.z = -depth / 2;
+  g.add(gable);
+
+  const door = new THREE.Mesh(new THREE.BoxGeometry(2 * OH, springY, 0.14), mat.door);
+  door.position.set(0, springY / 2, 0);
+  door.castShadow = true;
+  g.add(door);
+
+  const colGeo = new THREE.BoxGeometry(colW, springY, depth);
+  const colMid = OH + colW / 2;
+  for (const s of [-1, 1]) {
+    const col = new THREE.Mesh(colGeo, mat.stone);
+    col.position.set(s * colMid, springY / 2, 0);
+    col.castShadow = true;
+    g.add(col);
+  }
+
+  const plaque = new THREE.Mesh(new THREE.PlaneGeometry(2.0, 0.42), mat.arch.clone());
+  plaque.material.side = THREE.DoubleSide;
+  plaque.position.set(0, springY + 0.5, depth / 2 + 0.04);
+  g.add(plaque);
+
+  // set the arch into whichever perimeter wall the exit cell touches
+  const southZ = z0 + H * CELL, northZ = z0, eastX = x0 + W * CELL, westX = x0;
+  let gx, gz, gRot;
+  if (exitC === W - 1) { gx = eastX - 0.25; gz = exitPos.z; gRot = -Math.PI / 2; }   // east wall
+  else if (exitC === 0) { gx = westX + 0.25; gz = exitPos.z; gRot = Math.PI / 2; }   // west wall
+  else if (exitR === H - 1) { gx = exitPos.x; gz = southZ - 0.25; gRot = Math.PI; }  // south wall
+  else { gx = exitPos.x; gz = northZ + 0.25; gRot = 0; }                              // north wall
+  g.position.set(gx, 0, gz);
+  g.rotation.y = gRot;
+  world.add(g);
+
+  const cs = colW / 2 + 0.05;
+  if (exitC === W - 1 || exitC === 0) { // door width runs along Z
+    solids.push({ minx: gx - cs, maxx: gx + cs, minz: exitPos.z - colMid - cs, maxz: exitPos.z - colMid + cs });
+    solids.push({ minx: gx - cs, maxx: gx + cs, minz: exitPos.z + colMid - cs, maxz: exitPos.z + colMid + cs });
+  } else { // door width runs along X
+    solids.push({ minx: exitPos.x - colMid - cs, maxx: exitPos.x - colMid + cs, minz: gz - cs, maxz: gz + cs });
+    solids.push({ minx: exitPos.x + colMid - cs, maxx: exitPos.x + colMid + cs, minz: gz - cs, maxz: gz + cs });
+  }
+}
+
+// ---------------- LEVEL BUILD ----------------
+function buildLevel(n) {
+  if (world) { scene.remove(world); disposeGroup(world); }
+  world = new THREE.Group();
+  solids = [];
+  stoneHeads = [];
+  scene.add(world);
+
+  const cfg = levelConfig(n);
+  H = W = cfg.size;
+  maze = generateMaze(cfg.size, cfg.loops);
+  x0 = -(W * CELL) / 2;
+  z0 = -(H * CELL) / 2;
+
+  // walls & grave rows
+  for (let r = 0; r < H; r++) {
+    for (let c = 0; c < W; c++) {
+      const m = maze[r][c];
+      const cx = x0 + c * CELL + CELL / 2;
+      const cz = z0 + r * CELL + CELL / 2;
+      if (r === 0 && m.N) segment(r, c, 'N', cx, cz);
+      if (c === 0 && m.W) segment(r, c, 'W', cx, cz);
+      if (m.E) segment(r, c, 'E', cx, cz);
+      if (m.S) segment(r, c, 'S', cx, cz);
+    }
+  }
+
+  // the named headstones — one each, placed beside an open path
+  const usedCells = new Set();
+  for (let k = 0; k < SPECIAL.length; k++) {
+    for (let tries = 0; tries < 120; tries++) {
+      const r = Math.floor(Math.random() * H);
+      const c = Math.floor(Math.random() * W);
+      const cell = r + ',' + c;
+      if (usedCells.has(cell)) continue;
+      const m = maze[r][c];
+      const opts = []; // 0=N 1=S 2=W 3=E open side
+      if (r > 0 && !m.N) opts.push(0);
+      if (r < H - 1 && !m.S) opts.push(1);
+      if (c > 0 && !m.W) opts.push(2);
+      if (c < W - 1 && !m.E) opts.push(3);
+      if (!opts.length) continue;
+      const o = opts[Math.floor(Math.random() * opts.length)];
+      const cc = worldOfCell(r, c);
+      const d = CELL / 2 - 0.7;   // sit just off the walking line
+      let x = cc.x, z = cc.z, fx = 0, fz = 0;
+      if (o === 0) { z -= d; fz = -1; }        // north path
+      else if (o === 1) { z += d; fz = 1; }    // south path
+      else if (o === 2) { x -= d; fx = -1; }   // west path
+      else { x += d; fx = 1; }                 // east path
+      placeHeadstone(x, z, fx, fz, specialTex[k]);
+      usedCells.add(cell);
+      break;
+    }
+  }
+
+  // trees / snags / bushes
+  for (let r = 0; r < H; r++) {
+    for (let c = 0; c < W; c++) {
+      const { x, z } = worldOfCell(r, c);
+      const jx = x + (Math.random() - 0.5) * 3.4, jz = z + (Math.random() - 0.5) * 3.4;
+      const roll = Math.random();
+      if (roll < TREE_P * 0.5) addTree(jx, jz, 0.85 + Math.random() * 0.5);
+      else if (roll < TREE_P * 0.7) addSnag(jx, jz, 0.7 + Math.random() * 0.4);
+      else if (roll < TREE_P * 0.82 + 0.03) addBush(jx, jz, 0.7 + Math.random() * 0.5);
+      else if (roll < TREE_P * 0.82 + 0.03 + STAT_P) addStatue(jx, jz);
+    }
+  }
+
+  // ground mist
+  for (let i = 0; i < 44; i++) {
+    const s = 8 + Math.random() * 12;
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(s, s * 0.55), mat.mist);
+    m.rotation.x = -Math.PI / 2;
+    m.position.set(x0 + 1 + Math.random() * (H * CELL - 2), 0.12 + Math.random() * 0.7, z0 + 1 + Math.random() * (W * CELL - 2));
+    world.add(m);
+  }
+
+  // dust motes
+  DUST = 140;
+  const dustGeo = new THREE.BufferGeometry();
+  const dustPos = new Float32Array(DUST * 3);
+  dustVel = new Float32Array(DUST);
+  for (let i = 0; i < DUST; i++) {
+    dustPos[i * 3] = x0 + Math.random() * H * CELL;
+    dustPos[i * 3 + 1] = 0.3 + Math.random() * 5;
+    dustPos[i * 3 + 2] = z0 + Math.random() * W * CELL;
+    dustVel[i] = 0.1 + Math.random() * 0.3;
+  }
+  dustGeo.setAttribute('position', new THREE.BufferAttribute(dustPos, 3));
+  dust = new THREE.Points(dustGeo, new THREE.PointsMaterial({
+    map: radialTex, size: 0.07, transparent: true, opacity: 0.4, color: 0xe6e0c8,
+    depthWrite: false, blending: THREE.AdditiveBlending
+  }));
+  world.add(dust);
+
+  // exit doorway: pick a randomized far, wall-adjacent cell
+  const maxDist = (H - 1) + (W - 1);
+  const farCells = [];
+  for (let r = 0; r < H; r++) {
+    for (let c = 0; c < W; c++) {
+      const onEdge = (r === 0 || r === H - 1 || c === 0 || c === W - 1);
+      if (onEdge && r + c >= Math.floor(maxDist * 0.55)) farCells.push({ r, c });
+    }
+  }
+  const ex = farCells[Math.floor(Math.random() * farCells.length)];
+  buildArch(ex.r, ex.c);
+
+  const southZ = z0 + H * CELL, northZ = z0, eastX = x0 + W * CELL, westX = x0;
+  if (ex.c === W - 1) {                        // door in east wall
+    winPos = { x: eastX - 0.7, z: exitPos.z };
+    exitLight.position.set(eastX - 0.9, 2.2, exitPos.z);
+    doorGlow.position.set(eastX - 0.55, 2.0, exitPos.z);
+  } else if (ex.c === 0) {                     // west wall
+    winPos = { x: westX + 0.7, z: exitPos.z };
+    exitLight.position.set(westX + 0.9, 2.2, exitPos.z);
+    doorGlow.position.set(westX + 0.55, 2.0, exitPos.z);
+  } else if (ex.r === H - 1) {                 // south wall
+    winPos = { x: exitPos.x, z: southZ - 0.7 };
+    exitLight.position.set(exitPos.x, 2.2, southZ - 0.9);
+    doorGlow.position.set(exitPos.x, 2.0, southZ - 0.55);
+  } else {                                     // north wall
+    winPos = { x: exitPos.x, z: northZ + 0.7 };
+    exitLight.position.set(exitPos.x, 2.2, northZ + 0.9);
+    doorGlow.position.set(exitPos.x, 2.0, northZ + 0.55);
+  }
+
+  addBirds();
+
+  // reset player to the new maze's start
+  camera.position.set(x0 + CELL / 2, EYE_H, z0 + CELL / 2);
+  yaw = 0; pitch = 0;
+
+  levelTime = cfg.time;
+  timeLeft = cfg.time;
+  document.getElementById('level').textContent = 'Maze ' + (level + 1);
+}
+
+function stepDust(dt) {
+  if (!dust) return;
+  const p = dust.geometry.attributes.position.array;
+  for (let i = 0; i < DUST; i++) {
+    p[i * 3] += Math.sin(i + performance.now() * 0.0006) * dt * 0.2;
+    p[i * 3 + 1] += dustVel[i] * dt;
+    p[i * 3 + 2] += Math.cos(i + performance.now() * 0.0005) * dt * 0.2;
+    if (p[i * 3 + 1] > 6) p[i * 3 + 1] = 0.3;
+  }
+  dust.geometry.attributes.position.needsUpdate = true;
+}
+
+// ----- Birds (flock circling the exit, a visible cue) -----
+function makeBird() {
+  const body = new THREE.Group();
+  const mt = new THREE.MeshBasicMaterial({ color: 0x14171c, side: THREE.DoubleSide });
+  const wg = new THREE.PlaneGeometry(1.2, 0.34);
+  const lR = new THREE.Group(); lR.position.set(-0.5, 0, 0); lR.rotation.z = -0.5;
+  const rR = new THREE.Group(); rR.position.set(0.5, 0, 0); rR.rotation.z = 0.5;
+  const lw = new THREE.Mesh(wg, mt); lw.position.x = -0.6;
+  const rw = new THREE.Mesh(wg, mt); rw.position.x = 0.6;
+  lR.add(lw); rR.add(rw);
+  body.add(lR, rR);
+  body.userData.wings = [lR, rR];
+  return body;
+}
+function addBirds() {
+  birds = [];
+  const n = 7;
+  for (let i = 0; i < n; i++) {
+    const g = makeBird();
+    world.add(g);
+    birds.push({
+      g,
+      t: Math.random() * Math.PI * 2,
+      speed: 0.25 + Math.random() * 0.3,
+      r: 7 + Math.random() * 9,
+      h: 8.5 + Math.random() * 4.5,
+      phase: Math.random() * Math.PI * 2
+    });
+  }
+}
+function stepBirds(dt) {
+  for (const b of birds) {
+    b.t += b.speed * dt;
+    b.g.position.set(
+      exitPos.x + Math.cos(b.t) * b.r,
+      b.h + Math.sin(b.t * 1.4 + b.phase) * 1.3,
+      exitPos.z + Math.sin(b.t) * b.r
+    );
+    b.g.rotation.y = b.t + Math.PI / 2;
+    const flap = Math.sin(b.t * 8 + b.phase) * 1.05;
+    b.g.userData.wings[0].rotation.x = flap;
+    b.g.userData.wings[1].rotation.x = -flap;
+  }
+}
+
+// ---------------- INPUT ----------------
+const keys = {};
+let yaw = 0, pitch = 0;
+let started = false, won = false, escaped = false;
+let timeLeft = 0;
+let levelTime = 0;
+let score = 0;
+let best = Number(localStorage.getItem('gravemazeBest') || 0);
+const tally = [];
+document.getElementById('best').textContent = best ? 'Best ' + best : '';
+const clock = new THREE.Clock();
+const overlay = document.getElementById('overlay');
+const startBtn = document.getElementById('startBtn');
+const timerEl = document.getElementById('timer');
+
+function enterGame() {
+  overlay.classList.add('hidden');
+  renderer.domElement.requestPointerLock();
+}
+startBtn.addEventListener('click', enterGame);
+document.addEventListener('pointerlockchange', () => {
+  if (document.pointerLockElement === renderer.domElement) started = true;
+});
+document.addEventListener('mousemove', onMouseMove);
+function onMouseMove(e) {
+  yaw -= e.movementX * 0.0022;
+  pitch -= e.movementY * 0.0022;
+  pitch = Math.max(-1.55, Math.min(1.55, pitch));
+}
+window.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (won && e.code === 'Enter' && !e.repeat) {
+    if (escaped) { level += 1; buildLevel(level); }
+    else { buildLevel(level); }
+    won = false; escaped = false;
+    overlay.classList.add('hidden');
+    renderer.domElement.requestPointerLock();
+  }
+});
+window.addEventListener('keyup', e => keys[e.code] = false);
+
+// ---------------- COLLISION ----------------
+function collide(pos, radius) {
+  const { x, z } = pos;
+  for (const b of solids) {
+    const cx = Math.max(b.minx, Math.min(x, b.maxx));
+    const cz = Math.max(b.minz, Math.min(z, b.maxz));
+    const dx = x - cx, dz = z - cz;
+    const d2 = dx * dx + dz * dz;
+    if (d2 < radius * radius) {
+      const d = Math.sqrt(d2) || 0.0001;
+      const push = radius - d;
+      if (Math.abs(dx) > Math.abs(dz)) pos.x += (dx / d) * push;
+      else pos.z += (dz / d) * push;
+    }
+  }
+}
+
+// ---------------- GAME LOOP ----------------
+function endPhase(wonLevel) {
+  won = true;
+  overlay.classList.remove('hidden');
+  startBtn.style.display = 'none';
+  document.exitPointerLock();
+  const msg = document.getElementById('msg');
+  const secsLeft = Math.max(0, Math.round(timeLeft));
+  const gained = wonLevel ? 100 + secsLeft * 10 : 0;
+  score += gained;
+  document.getElementById('score').textContent = score;
+  if (score > best) {
+    best = score;
+    localStorage.setItem('gravemazeBest', best);
+    document.getElementById('best').textContent = 'Best ' + best;
+  }
+  tally.push({ maze: level + 1, pts: gained });
+  const rundown = tally.slice(-8).map(e => `M${e.maze}: ${e.pts}`).join(' &middot; ');
+  if (wonLevel) {
+    escaped = true;
+    msg.innerHTML = `You escaped Maze ${level + 1} with <span class="live">${secsLeft}s left</span> &mdash; ` +
+      `<span class="live">+${gained} pts</span> (${score} total).<br>` +
+      `Press <span class="kbd">Enter</span> for the next, harder maze.<br>` +
+      `<span style="color:#8a8;font-size:13px;">Tally: ${rundown}</span>`;
+  } else {
+    escaped = false;
+    msg.innerHTML = 'Time&rsquo;s up &mdash; the cemetery keeps its dead. No points.<br>' +
+      `Press <span class="kbd">Enter</span> to try Maze ${level + 1} again.<br>` +
+      `<span style="color:#8a8;font-size:13px;">Tally: ${rundown}</span>`;
+  }
+}
+
+function update(dt) {
+  camera.position.y = EYE_H;
+  const forward = new THREE.Vector3(-Math.sin(yaw), 0, -Math.cos(yaw));
+  const right = new THREE.Vector3(Math.cos(yaw), 0, -Math.sin(yaw));
+  const move = new THREE.Vector3();
+  if (keys['KeyW']) move.add(forward);
+  if (keys['KeyS']) move.sub(forward);
+  if (keys['KeyA']) move.sub(right);
+  if (keys['KeyD']) move.add(right);
+  if (move.lengthSq() > 0) {
+    move.normalize().multiplyScalar(SPEED * dt);
+    camera.position.x += move.x;
+    camera.position.z += move.z;
+  }
+  collide(camera.position, HURT_R);
+  const d = Math.hypot(camera.position.x - winPos.x, camera.position.z - winPos.z);
+  if (d < WIN_R && !won) endPhase(true);
+  camera.rotation.order = 'YXZ';
+  camera.rotation.y = yaw;
+  camera.rotation.x = pitch;
+}
+
+function render() {
+  requestAnimationFrame(render);
+  const dt = Math.min(clock.getDelta(), 0.05);
+  stepDust(dt);
+  stepBirds(dt);
+  if (!won && started) {
+    timeLeft -= dt;
+    if (timeLeft <= 0) {
+      timeLeft = 0;
+      endPhase(false);
+    } else {
+      timerEl.textContent = Math.ceil(timeLeft).toString();
+      update(dt);
+    }
+  }
+  renderer.render(scene, camera);
+}
+buildLevel(0);
+render();
+
+window.addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
