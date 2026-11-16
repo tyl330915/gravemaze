@@ -694,10 +694,10 @@ function buildArch(exitR, exitC) {
 // to a fine grid, dilate blocked cells by the player radius, then flood-fill.
 // This mirrors the real player circle, so it can't miss an interior choke point.
 function levelPlayable() {
-  const step = 0.25;
+  const step = 0.2;
   const gx = Math.ceil((W * CELL) / step);
   const gz = Math.ceil((H * CELL) / step);
-  const pad = Math.ceil(HURT_R / step) + 1;   // dilation (>= player radius)
+  const pad = Math.ceil(HURT_R / step);       // dilation (just >= player radius, keeps door reachable)
   const idx = v => Math.floor((v - x0) / step);
   const idz = v => Math.floor((v - z0) / step);
   const blocked = new Uint8Array(gx * gz);
@@ -711,8 +711,15 @@ function levelPlayable() {
   }
   const sx = Math.max(0, Math.min(gx - 1, idx(x0 + CELL / 2)));
   const sz = Math.max(0, Math.min(gz - 1, idz(z0 + CELL / 2)));
-  const gbx = Math.max(0, Math.min(gx - 1, idx(winPos.x)));
-  const gbz = Math.max(0, Math.min(gz - 1, idz(winPos.z)));
+  // goal = a spot just inside the exit cell, in front of the door (not inside the wall)
+  const ec = worldOfCell(exitR, exitC);
+  let goalX, goalZ;
+  if (exitC === W - 1) { goalX = x0 + W * CELL - 1.5; goalZ = ec.z; }
+  else if (exitC === 0) { goalX = x0 + 1.5; goalZ = ec.z; }
+  else if (exitR === H - 1) { goalX = ec.x; goalZ = z0 + H * CELL - 1.5; }
+  else { goalX = ec.x; goalZ = z0 + 1.5; }
+  const gbx = Math.max(0, Math.min(gx - 1, idx(goalX)));
+  const gbz = Math.max(0, Math.min(gz - 1, idz(goalZ)));
   const seen = new Uint8Array(gx * gz);
   const q = [sz * gx + sx];
   seen[sz * gx + sx] = 1;
